@@ -1,10 +1,11 @@
 # Amazon QuickWork CPA 原生插件
 
-安装在 CLIProxyAPI 内核中，将 Chat Completions 请求转给**另行部署、明确获授权的** QuickWork HTTP 桥接服务。本插件不直接连接 AWS，不模拟桌面客户端，不登录 AWS 或提取、续期 AWS 凭证；也不执行客户端工具。使用的是桥接服务自己的 Bearer key，不是 AWS JWT、Cookie 或 refresh token。
+由 CPA 管理 QuickWork OAuth 登录和凭据，插件直接连接 QuickWork。**不需要 `quickproxy`、HTTP 桥接、桌面客户端或独立账号数据库。** 仅限获授权的账号和服务；本项目非 AWS 官方产品。
 
-- 实测 Linux amd64，支持插件的 CPA 内核 v8.0.78、v8.0.80（ABI 1、RPC schema 10）；更旧版本和其他平台未验证。
-- 将 ZIP 根目录的 `aws-quickwork.so` 放进 CPA 插件目录，启用插件并配置 `bridge_origins`。配置与 auth 文件范例见 [英文 README](README.md)。凭据类型填 `aws-quickwork`，仅填已批准的 `bridge_origin` 与该服务自己的 `bridge_key`。凭据文件建议使用 `0600`。每个需要独立使用的 AWS 账号应使用独立的桥接实例/地址与密钥。同一内核需将账号路由分开时，为各凭据设置不同 `prefix`，启用 `routing.force-model-prefix: true`，并请求 `prefix/aws-quickwork-smart` 等带前缀的模型；前缀不是用户访问控制。
-- 对外提供 `/v1/models` 和 `/v1/chat/completions`，支持 JSON/SSE；`aws-quickwork-{smart,fast,balanced,auto}` 是模式别名。保留请求体中的工具定义、调用历史和结果 ID，工具仍由客户端执行。不会透传原始 `X-Thread-Id`（避免跟随 CPA 调度跨账号复用）；没有原生 Responses API 或 AWS 客户端登录。
-- CPA 管理端可按 `auth_index` 调用此插件的配额能力。桥接接口没有账户额度数据，返回未知而不是 0，不消耗推理次数、不探测未公开接口。HTTP 429 只作为限流提示处理，不当作余额或用量；不提供配额重置。
+将 Windows amd64 的 `aws-quickwork.dll` 或 Linux amd64 的 `aws-quickwork.so` 放入 CPA 插件目录，启用插件后重启核心。在 CPA 登录面板选择 **QuickWork Personal** 或 **QuickWork Enterprise**，并保持面板开启直到保存凭据。本地浏览器自动回调；远程部署可先粘贴发现链接、再通过 CPA 原生接口提交授权码回调，接口见[英文说明](README.md)。旧桥接版升级需要删除旧动态库、`bridge_origins` 和旧凭据，重新登录。
 
-构建：`go test -race ./... && ./build.sh`（Go 1.26.10+、C 编译器、Python 3）。产物默认放至 `dist/`。
+登录时参照 Trae 的双卡片方式区分个人账号与企业 SSO；这两个 QuickWork 入口不代表国内版和国际版。浏览器回调根据语言显示中英文进度、继续按钮及返回 CPA 的提示。
+
+调用 `/v1/models` 和 `/v1/chat/completions`，使用 `aws-quickwork-{smart,fast,balanced,auto}`。支持文本 JSON/SSE、客户端工具调用及上游报告的用量。每轮发送完整消息和工具历史；不复用 `X-Thread-Id`，不支持 Responses API 或配额重置。目前未确认该登录凭据可读取的 Amazon Quick 余额接口；额度面板会明确提示，不会将余额显示为零。
+
+运行 `go test -race ./...`、`./build.sh` 构建。0.2.0 是原生预览版，仍需用实际获授权账号验证登录、刷新和聊天后才能用于正式发布。

@@ -4,14 +4,14 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
-	"sort"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
@@ -20,61 +20,65 @@ import (
 func TestArchiveWithCPAInstaller(t *testing.T) {
 	path := os.Getenv("QUICKWORK_INSTALL_ARCHIVE")
 	if path == "" {
-		t.Skip("set QUICKWORK_INSTALL_ARCHIVE to the built ZIP")
+		t.Skip("set QUICKWORK_INSTALL_ARCHIVE to a built ZIP")
 	}
-	b, e := os.ReadFile(path)
-	if e != nil {
-		t.Fatal(e)
-	}
-	z, e := zip.NewReader(bytes.NewReader(b), int64(len(b)))
-	if e != nil {
-		t.Fatal(e)
-	}
-	var names []string
-	for _, f := range z.File {
-		names = append(names, f.Name)
-	}
-	sort.Strings(names)
-	if !reflect.DeepEqual(names, []string{"LICENSE", "README.md", "README.zh-CN.md", "aws-quickwork.so", "manifest.json"}) {
-		t.Fatalf("wrong archive entries: %v", names)
-	}
-	f, e := z.Open("aws-quickwork.so")
-	if e != nil {
-		t.Fatal(e)
-	}
-	lib, e := io.ReadAll(f)
-	f.Close()
-	if e != nil || len(lib) < 4 || string(lib[:4]) != "\x7fELF" {
-		t.Fatal("archive is not shipping an ELF library")
-	}
-	digest := fmt.Sprintf("%x", sha256.Sum256(b))
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/aws-quickwork_0.1.0_linux_amd64.zip" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/zip")
-		_, _ = w.Write(b)
-	}))
-	defer srv.Close()
-	client := pluginstore.NewClient(srv.Client(), "")
-	manifest := pluginstore.Manifest{SchemaVersion: pluginstore.SchemaVersionV2, ID: "aws-quickwork", Version: "0.1.0", Install: pluginstore.InstallPlan{
-		Type: pluginstore.InstallTypeDirect, Artifacts: []pluginstore.Artifact{{GOOS: "linux", GOARCH: "amd64", URL: srv.URL + "/aws-quickwork_0.1.0_linux_amd64.zip", SHA256: digest, Size: int64(len(b))}},
-	}}
-	dir := t.TempDir()
-	opts := pluginstore.InstallOptions{PluginsDir: dir, GOOS: "linux", GOARCH: "amd64"}
-	result, err := client.InstallManifest(t.Context(), manifest, opts)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(dir, "linux", "amd64", "aws-quickwork-v0.1.0.so")
-	written, err := os.ReadFile(result.Path)
-	if err != nil || result.Path != want || !bytes.Equal(written, lib) {
-		t.Fatalf("unexpected installed file: %q (%v)", result.Path, err)
+	archive, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Logf("CPA direct installer verified %s, matching linux/amd64 library SHA256=%x", filepath.Base(path), sha256.Sum256(written))
-	manifest.Install.Artifacts[0].SHA256 = fmt.Sprintf("%064x", 0)
-	if _, e := client.InstallManifest(t.Context(), manifest, opts); e == nil {
-		t.Fatal("installer accepted an invalid checksum")
+	read := func(name string) []byte {
+		file, err := archive.Open(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		body, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	var metadata struct{ ID, Version string }
+	if json.Unmarshal(read("manifest.json"), &metadata) != nil || metadata.ID != "aws-quickwork" || metadata.Version == "" {
+		t.Fatal("invalid manifest")
+	}
+	var descriptor struct {
+		Version string `json:"plugin_version"`
+	}
+	if json.Unmarshal(read(metadata.ID+".omc.json"), &descriptor) != nil || descriptor.Version != metadata.Version {
+		t.Fatal("invalid OMC descriptor")
+	}
+	platform, extension, magic := "linux", ".so", "\x7fELF"
+	if strings.HasSuffix(path, "_windows_amd64.zip") {
+		platform, extension, magic = "windows", ".dll", "MZ"
+	}
+	library := read(metadata.ID + extension)
+	if !bytes.HasPrefix(library, []byte(magic)) {
+		t.Fatal("library format does not match artifact platform")
+	}
+	serve := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(data) }))
+	defer serve.Close()
+	client := pluginstore.NewClient(serve.Client(), "")
+	manifest := pluginstore.Manifest{SchemaVersion: pluginstore.SchemaVersionV2, ID: metadata.ID, Version: metadata.Version, Install: pluginstore.InstallPlan{
+		Type: pluginstore.InstallTypeDirect, Artifacts: []pluginstore.Artifact{{GOOS: platform, GOARCH: "amd64", URL: serve.URL + "/" + filepath.Base(path), SHA256: fmt.Sprintf("%x", sha256.Sum256(data)), Size: int64(len(data))}},
+	}}
+	dir := t.TempDir()
+	options := pluginstore.InstallOptions{PluginsDir: dir, GOOS: platform, GOARCH: "amd64"}
+	result, err := client.InstallManifest(t.Context(), manifest, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, platform, "amd64", metadata.ID+"-v"+metadata.Version+extension)
+	deployed, err := os.ReadFile(result.Path)
+	if err != nil || result.Path != want || !bytes.Equal(deployed, library) {
+		t.Fatalf("wrong installed artifact at %q: %v", result.Path, err)
+	}
+	manifest.Install.Artifacts[0].SHA256 = strings.Repeat("0", 64)
+	if _, err := client.InstallManifest(t.Context(), manifest, options); err == nil {
+		t.Fatal("installer accepted invalid checksum")
 	}
 }
