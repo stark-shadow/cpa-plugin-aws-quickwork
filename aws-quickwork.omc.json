@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "plugin_id": "aws-quickwork",
+  "plugin_version": "0.2.1",
+  "i18n": {
+    "description": {
+      "en": "Native Amazon QuickWork provider for CLIProxyAPI with browser OAuth and direct Chat Completions. No separate bridge process is required.",
+      "zh": "CLIProxyAPI 原生 Amazon QuickWork 提供商，支持浏览器 OAuth 和直连聊天，无需单独部署桥接服务。"
+    }
+  }
+}

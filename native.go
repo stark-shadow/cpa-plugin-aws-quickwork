@@ -39,10 +39,12 @@ import "C"
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func main() {}
@@ -66,15 +68,30 @@ func cliproxy_plugin_init(host *C.qw_host, out *C.qw_plugin) C.int {
 }
 
 func callback(method string, value any) bool {
+	_, err := callHost(method, value)
+	return err == nil
+}
+
+func hostRequest(callbackID string, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	var response pluginapi.HTTPResponse
+	result, err := callHost(pluginabi.MethodHostHTTPDo, map[string]any{"host_callback_id": callbackID, "request": req})
+	if err != nil {
+		return response, err
+	}
+	err = json.Unmarshal(result, &response)
+	return response, err
+}
+
+func callHost(method string, value any) (json.RawMessage, error) {
 	nativeMu.RLock()
 	host := nativeHost
 	nativeMu.RUnlock()
 	if host.call == nil {
-		return false
+		return nil, errors.New("host callback unavailable")
 	}
 	data, err := json.Marshal(value)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	name := C.CString(method)
 	defer C.free(unsafe.Pointer(name))
@@ -86,10 +103,13 @@ func callback(method string, value any) bool {
 		defer C.free_host(host, out)
 	}
 	if code != 0 || out.ptr == nil || out.len > maxRPC {
-		return false
+		return nil, errors.New("host callback failed")
 	}
 	var response pluginabi.Envelope
-	return json.Unmarshal(C.GoBytes(out.ptr, C.int(out.len)), &response) == nil && response.OK
+	if err := json.Unmarshal(C.GoBytes(out.ptr, C.int(out.len)), &response); err != nil || !response.OK {
+		return nil, errors.New("host rejected callback")
+	}
+	return response.Result, nil
 }
 
 //export quickWorkCall
@@ -112,7 +132,7 @@ func quickWorkCall(method *C.char, raw *C.uint8_t, size C.size_t, out *C.qw_buff
 	if method == nil || size > maxRPC || (size > 0 && raw == nil) {
 		encoded, _ = pluginabi.NewErrorEnvelope("invalid_request", "Invalid QuickWork RPC input", 400)
 	} else {
-		encoded = envelope(instance.call(C.GoString(method), C.GoBytes(unsafe.Pointer(raw), C.int(size)), callback))
+		encoded = envelope(instance.call(C.GoString(method), C.GoBytes(unsafe.Pointer(raw), C.int(size)), callback, hostRequest))
 	}
 	out.ptr, out.len = C.CBytes(encoded), C.size_t(len(encoded))
 	return 0
