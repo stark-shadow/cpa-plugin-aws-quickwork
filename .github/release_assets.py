@@ -45,7 +45,7 @@ def main(mode, source, destination, *targets):
         destination.mkdir()
         shutil.copyfile(source / filename, destination / filename)
         (destination / CHECKSUMS).write_text(checksum, encoding="ascii", newline="\n")
-        print((destination / filename).as_posix())
+        print((destination / filename).resolve().as_posix())
     elif mode == "merge" and not targets:
         require_entries(source, archives)
         verified = []
