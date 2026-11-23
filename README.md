@@ -4,7 +4,7 @@ QuickWork OAuth and direct OpenAI-compatible chat execution in CLIProxyAPI. No `
 
 ## Install and sign in
 
-Place `aws-quickwork.dll` (Windows amd64) or `aws-quickwork.so` (Linux amd64) in the CPA plugin directory and restart CPA. The optional OMC descriptor does not change the installation or login process.
+Place `aws-quickwork.dll` (Windows amd64), `aws-quickwork.so` (Linux amd64), or `aws-quickwork.dylib` (macOS arm64/amd64) in the CPA plugin directory and restart CPA. The optional OMC descriptor does not change the installation or login process.
 
 ```yaml
 plugins:
@@ -26,4 +26,4 @@ Call `/v1/models` and `/v1/chat/completions` with `aws-quickwork-smart`, `aws-qu
 
 ## Build and validation
 
-Use Go 1.26.10+, a CGO-compatible C compiler and Python 3. Run `go test -race ./...` and `./build.sh` (`PYTHON=python` if appropriate). The archive and checksums go to `dist/`. See `acceptance/` for local host verification. The 0.2.0 native implementation is a preview until authorized live AWS sign-in, refresh, and chat have been validated.
+Use Go 1.26.10+, a CGO-compatible C compiler and Python 3. Run `go test -race ./...` and `./build.sh` (`PYTHON=python` if appropriate). The archive and checksums go to `dist/`. The GitHub Actions **Build plugin** workflow builds and tests all four platforms natively. Download `aws-quickwork-release-assets` from a successful run for the four release ZIPs and their combined `checksums.txt`; the workflow does not publish a release. See `acceptance/` for local host verification. The 0.2.0 native implementation is a preview until authorized live AWS sign-in, refresh, and chat have been validated.

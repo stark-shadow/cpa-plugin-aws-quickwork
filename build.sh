@@ -17,6 +17,8 @@ PY
 case "$os" in
     windows) lib="aws-quickwork.dll" ;;
     linux) lib="aws-quickwork.so" ;;
+    darwin) lib="aws-quickwork.dylib" ;;
+    *) echo "unsupported library platform: $os" >&2; exit 1 ;;
 esac
 archive="aws-quickwork_${version}_${os}_${arch}.zip"
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o "$output/$lib" .
