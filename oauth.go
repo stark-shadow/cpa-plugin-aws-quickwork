@@ -45,6 +45,8 @@ type credential struct {
 	Identity     string    `json:"id_token,omitempty"`
 	Expires      time.Time `json:"expires_at"`
 	Actor        string    `json:"actor"`
+	AWSAccountID string    `json:"aws_account_id,omitempty"`
+	Region       string    `json:"region,omitempty"`
 	Email        string    `json:"email,omitempty"`
 	Label        string    `json:"label,omitempty"`
 	Prefix       string    `json:"prefix,omitempty"`
@@ -91,6 +93,10 @@ func badCredential() *pluginabi.Error {
 	return pluginabi.NewError("reauth_required", "QuickWork requires a native OAuth credential; sign in using the CPA panel (bridge keys are no longer accepted)", 401)
 }
 
+func expiredCredential() *pluginabi.Error {
+	return pluginabi.NewError("reauth_required", "QuickWork OAuth token has expired and could not be refreshed; please sign in again in the CPA panel", 401)
+}
+
 func readCredential(provider string, raw []byte) (credential, *pluginabi.Error) {
 	var saved credential
 	if provider != id || len(raw) > 128<<10 || json.Unmarshal(raw, &saved) != nil || saved.Type != id || (saved.Portal != personal && saved.Portal != enterprise) || saved.ClientID == "" || saved.Expires.IsZero() || saved.bearer() == "" || saved.Actor == "" {
@@ -121,24 +127,64 @@ func parseAuth(req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, *pl
 	return pluginapi.AuthParseResponse{Handled: true, Auth: result}, nil
 }
 
+func nextRefreshAt(expires time.Time) time.Time {
+	remaining := time.Until(expires)
+	margin := 5 * time.Minute
+	if remaining < 10*time.Minute {
+		margin = 2 * time.Minute
+	}
+	return expires.Add(-margin)
+}
+
 func (c credential) auth(storage []byte) pluginapi.AuthData {
 	if storage == nil {
 		storage, _ = json.Marshal(c)
 	}
 	fingerprint := sha256.Sum256([]byte(c.Portal + "\x00" + c.Tenant + "\x00" + c.Actor))
 	filename := id + "-" + hex.EncodeToString(fingerprint[:12]) + ".json"
-	return pluginapi.AuthData{Provider: id, ID: filename, FileName: filename, Label: c.Label, Prefix: c.Prefix, Disabled: c.Disabled, ProxyURL: c.ProxyURL, StorageJSON: storage,
-		Metadata: map[string]any{"type": id, "oauth_provider": c.Portal, "email": c.Email}, NextRefreshAfter: c.Expires.Add(-2 * time.Minute)}
+	return pluginapi.AuthData{
+		Provider:    id,
+		ID:          filename,
+		FileName:    filename,
+		Label:       c.Label,
+		Prefix:      c.Prefix,
+		Disabled:    c.Disabled,
+		ProxyURL:    c.ProxyURL,
+		StorageJSON: storage,
+		Metadata: map[string]any{
+			"type":                     id,
+			"oauth_provider":           c.Portal,
+			"email":                    c.Email,
+			"expires_at":               c.Expires.UTC().Format(time.RFC3339),
+			"refresh_interval_seconds": 300,
+		},
+		Attributes: map[string]string{
+			"refresh_interval_seconds": "300",
+		},
+		NextRefreshAfter: nextRefreshAt(c.Expires),
+	}
 }
 
 type oauthTransport struct {
 	send       hostHTTP
 	callbackID string
+	proxyURL   string
+	ctx        context.Context
+}
+
+func (transport oauthTransport) withProxy(ctx context.Context, proxyURL string) oauthTransport {
+	copy := transport
+	copy.ctx = ctx
+	copy.proxyURL = strings.TrimSpace(proxyURL)
+	return copy
 }
 
 func (transport oauthTransport) post(endpoint string, body any, access string) (map[string]any, *pluginabi.Error) {
 	failure := pluginabi.NewError("oauth_upstream", "QuickWork OAuth upstream request failed", 502)
-	if _, ok := quickURL(endpoint); !ok || transport.send == nil || transport.callbackID == "" {
+	if _, ok := quickURL(endpoint); !ok {
+		return nil, failure
+	}
+	if strings.TrimSpace(transport.proxyURL) == "" && (transport.send == nil || transport.callbackID == "") {
 		return nil, failure
 	}
 	media := "application/json"
@@ -153,7 +199,16 @@ func (transport oauthTransport) post(endpoint string, body any, access string) (
 	if access != "" {
 		headers.Set("Authorization", "Bearer "+access)
 	}
-	response, err := transport.send(transport.callbackID, pluginapi.HTTPRequest{Method: http.MethodPost, URL: endpoint, Headers: headers, Body: data})
+	ctx := transport.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	response, err := doOutboundHTTP(ctx, transport, transport.proxyURL, 30*time.Second, pluginapi.HTTPRequest{
+		Method:  http.MethodPost,
+		URL:     endpoint,
+		Headers: headers,
+		Body:    data,
+	})
 	if err != nil || len(response.Body) > 512<<10 {
 		return nil, failure
 	}
@@ -162,8 +217,12 @@ func (transport oauthTransport) post(endpoint string, body any, access string) (
 		return nil, failure
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		if firstString(decoded, "error", "code", "__type") == "invalid_grant" || response.StatusCode == 401 {
-			return nil, badCredential()
+		switch normalizeErrorCode(firstString(decoded, "error", "code", "__type")) {
+		case "invalidgrant", "expiredtoken", "invalidclient", "unauthorizedclient", "accessdenied":
+			return nil, expiredCredential()
+		}
+		if response.StatusCode == 401 {
+			return nil, expiredCredential()
 		}
 		return nil, failure
 	}
@@ -179,37 +238,84 @@ func firstString(values map[string]any, keys ...string) string {
 	return ""
 }
 
+func firstInt64(values map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		switch v := values[key].(type) {
+		case float64:
+			return int64(v)
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		case json.Number:
+			if n, err := v.Int64(); err == nil {
+				return n
+			}
+		case string:
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func decodeJWTClaims(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload := parts[1]
+	padded := payload + strings.Repeat("=", (4-len(payload)%4)%4)
+	body, err := base64.URLEncoding.DecodeString(padded)
+	if err != nil {
+		body, err = base64.RawURLEncoding.DecodeString(payload)
+		if err != nil {
+			return nil
+		}
+	}
+	var claims map[string]any
+	if json.Unmarshal(body, &claims) != nil {
+		return nil
+	}
+	return claims
+}
+
 func (c *credential) tokens(transport oauthTransport, exchange any) *pluginabi.Error {
 	data, failure := transport.post(c.TokenURL, exchange, "")
 	if failure != nil {
 		return failure
 	}
 	c.Access = firstString(data, "access_token", "accessToken")
-	c.Identity = firstString(data, "id_token", "idToken")
-	if next := firstString(data, "refresh_token", "refreshToken"); next != "" {
-		c.Refresh = next
+	// Refresh responses are not guaranteed to repeat id_token; preserve the
+	// previous one so WebSocket auth does not silently fall back to access_token.
+	if nextID := firstString(data, "id_token", "idToken"); nextID != "" {
+		c.Identity = nextID
 	}
-	c.Expires = time.Time{}
-	for _, key := range []string{"expires_in", "expiresIn"} {
-		if seconds, ok := data[key].(float64); ok && seconds > 0 && seconds < 86400*30 {
-			c.Expires = time.Now().Add(time.Duration(seconds) * time.Second)
-			break
-		}
+	if nextRefresh := firstString(data, "refresh_token", "refreshToken"); nextRefresh != "" {
+		c.Refresh = nextRefresh
 	}
 	if c.Access == "" || c.Refresh == "" {
 		return badCredential()
 	}
-	if c.Expires.IsZero() {
-		parts := strings.Split(c.bearer(), ".")
-		if len(parts) == 3 {
-			claims, _ := base64.RawURLEncoding.DecodeString(parts[1])
-			var expiry struct {
-				Exp int64 `json:"exp"`
-			}
-			if json.Unmarshal(claims, &expiry) == nil && expiry.Exp > time.Now().Unix() {
-				c.Expires = time.Unix(expiry.Exp, 0)
+
+	now := time.Now()
+	c.Expires = time.Time{}
+	if seconds := firstInt64(data, "expires_in", "expiresIn"); seconds > 0 && seconds < 86400*30 {
+		c.Expires = now.Add(time.Duration(seconds) * time.Second)
+	}
+	// The WebSocket uses the ID token when present; refresh before whichever
+	// token expires first.
+	if claims := decodeJWTClaims(c.bearer()); claims != nil {
+		if exp := firstInt64(claims, "exp"); exp > now.Unix() {
+			jwtExpiry := time.Unix(exp, 0)
+			if c.Expires.IsZero() || jwtExpiry.Before(c.Expires) {
+				c.Expires = jwtExpiry
 			}
 		}
+	}
+	if c.Expires.IsZero() && c.Refresh != "" {
+		c.Expires = now.Add(50 * time.Minute)
 	}
 	if c.Expires.IsZero() {
 		return pluginabi.NewError("oauth_protocol", "QuickWork did not return a token expiry", 502)
@@ -229,9 +335,28 @@ func (c *credential) loadIdentity(transport oauthTransport) *pluginabi.Error {
 	if inner, ok := data["userInfo"].(map[string]any); ok {
 		data = inner
 	}
-	c.Actor = firstString(data, "userArn", "user_arn", "quicksightExternalUserArn")
+	claims := decodeJWTClaims(c.Identity)
+	if claims == nil {
+		claims = decodeJWTClaims(c.Access)
+	}
+	c.Actor = firstString(data, "userArn", "user_arn", "quicksightExternalUserArn", "quicksight_external_user_arn")
+	if c.Actor == "" {
+		if sub := firstString(claims, "sub"); strings.HasPrefix(sub, "arn:") {
+			c.Actor = sub
+		}
+	}
 	c.Email = firstString(data, "email", "emailAddress")
-	c.Label = firstString(data, "displayName", "display_name", "email", "emailAddress")
+	c.Label = firstString(data, "displayName", "display_name", "email", "emailAddress", "userName", "user_name", "username")
+	if acctID := firstString(data, "awsAccountId", "aws_account_id", "accountId"); acctID != "" {
+		c.AWSAccountID = acctID
+	} else if acctID := firstString(claims, "aws_account_id"); acctID != "" {
+		c.AWSAccountID = acctID
+	}
+	if c.Region == "" {
+		if reg := firstString(claims, "region"); regionPattern.MatchString(reg) {
+			c.Region = reg
+		}
+	}
 	if c.Actor == "" {
 		return pluginabi.NewError("oauth_protocol", "QuickWork did not identify the signed-in account", 502)
 	}
@@ -370,10 +495,10 @@ func (f *loginFlow) processDiscovery(query url.Values, transport oauthTransport)
 	if query.Get("error") != "" {
 		return loginInput()
 	}
-	saved := credential{Type: id, Portal: f.portal}
+	saved := credential{Type: id, Portal: f.portal, Region: f.region}
 	field := func(keys ...string) string {
 		for _, key := range keys {
-			if value := query.Get(key); value != "" {
+			if value := strings.TrimSpace(query.Get(key)); value != "" {
 				return value
 			}
 		}
@@ -383,8 +508,14 @@ func (f *loginFlow) processDiscovery(query url.Values, transport oauthTransport)
 	if saved.Tenant == "" && f.portal == personal {
 		saved.Tenant = personalTenant
 	}
+	if saved.Tenant != "" && !strings.Contains(saved.Tenant, "://") {
+		saved.Tenant = "https://" + saved.Tenant
+	}
 	if _, ok := validTenant(saved.Tenant); !ok {
 		return loginInput()
+	}
+	if discoveredRegion := field("region"); regionPattern.MatchString(discoveredRegion) {
+		saved.Region = discoveredRegion
 	}
 	var authorize string
 	scope := personalScope
@@ -548,20 +679,34 @@ func (g *generation) remoteDiscovery(req pluginapi.ManagementRequest, transport 
 		return bad()
 	}
 	f := item.(*loginFlow)
-	callback, err := url.Parse(submitted.RedirectURL)
-	if err != nil || callback.Scheme != "http" || callback.User != nil || callback.Path != "/callback" || callback.Fragment != "" {
+	rawURL := strings.TrimSpace(submitted.RedirectURL)
+	rawURL = strings.Trim(rawURL, "\"'<>`")
+	rawURL = strings.ReplaceAll(rawURL, "&amp;", "&")
+	rawURL = strings.ReplaceAll(rawURL, `\&`, "&")
+	callback, err := url.Parse(rawURL)
+	if err != nil || callback.Scheme != "http" || callback.User != nil || callback.Path != "/callback" {
 		return bad()
 	}
 	expected, _ := url.Parse(f.redirect)
 	if (callback.Hostname() != "localhost" && callback.Hostname() != "127.0.0.1") || callback.Port() != expected.Port() {
 		return bad()
 	}
+	values := callback.Query()
+	if callback.Fragment != "" {
+		if fragment, err := url.ParseQuery(callback.Fragment); err == nil {
+			for key, vals := range fragment {
+				if values.Get(key) == "" {
+					values[key] = vals
+				}
+			}
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.terminal != nil || f.completed != nil {
 		return bad()
 	}
-	if failure := f.processDiscovery(callback.Query(), transport); failure != nil {
+	if failure := f.processDiscovery(values, transport); failure != nil {
 		return reply(failure.HTTPStatus, map[string]string{"error": failure.Message})
 	}
 	return reply(200, map[string]string{"authorize_url": f.authorize})
@@ -571,6 +716,32 @@ type refreshFlight struct {
 	done    chan struct{}
 	result  pluginapi.AuthRefreshResponse
 	failure *pluginabi.Error
+}
+
+func mergeStorageJSON(base []byte, c credential) []byte {
+	fresh, err := json.Marshal(c)
+	if err != nil {
+		return fresh
+	}
+	if len(base) == 0 {
+		return fresh
+	}
+	var merged map[string]any
+	if json.Unmarshal(base, &merged) != nil || merged == nil {
+		return fresh
+	}
+	var overlay map[string]any
+	if json.Unmarshal(fresh, &overlay) != nil || overlay == nil {
+		return fresh
+	}
+	for k, v := range overlay {
+		merged[k] = v
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return fresh
+	}
+	return out
 }
 
 func (g *generation) refresh(req pluginapi.AuthRefreshRequest, transport oauthTransport) (pluginapi.AuthRefreshResponse, *pluginabi.Error) {
@@ -611,10 +782,13 @@ func (g *generation) refresh(req pluginapi.AuthRefreshRequest, transport oauthTr
 	} else {
 		exchange = map[string]string{"grantType": "refresh_token", "clientId": saved.ClientID, "clientSecret": saved.ClientSecret, "refreshToken": saved.Refresh}
 	}
-	if pending.failure = saved.tokens(transport, exchange); pending.failure != nil {
+	ctx, cancel := context.WithTimeout(g.ctx, 30*time.Second)
+	defer cancel()
+	proxyRaw := effectiveProxyURL(saved.ProxyURL, firstString(req.Metadata, "proxy_url"), g.ProxyURL)
+	if pending.failure = saved.tokens(transport.withProxy(ctx, proxyRaw), exchange); pending.failure != nil {
 		return empty, pending.failure
 	}
-	updated := saved.auth(nil)
+	updated := saved.auth(mergeStorageJSON(req.StorageJSON, saved))
 	updated.ID = req.AuthID
 	for key, value := range req.Metadata {
 		switch key {
@@ -625,4 +799,65 @@ func (g *generation) refresh(req pluginapi.AuthRefreshRequest, transport oauthTr
 	}
 	pending.result = pluginapi.AuthRefreshResponse{Auth: updated, NextRefreshAfter: updated.NextRefreshAfter}
 	return pending.result, nil
+}
+
+func authFileNameForSave(authID string, attrs map[string]string, fallback string) string {
+	if attrs != nil {
+		if path := strings.TrimSpace(attrs["path"]); path != "" {
+			if base := filepath.Base(path); strings.HasSuffix(strings.ToLower(base), ".json") {
+				return base
+			}
+		}
+	}
+	if base := filepath.Base(strings.TrimSpace(authID)); strings.HasSuffix(strings.ToLower(base), ".json") {
+		return base
+	}
+	return fallback
+}
+
+func (g *generation) refreshAndPersist(authID, authProvider string, storageJSON []byte, authMeta map[string]any, authAttrs map[string]string, transport oauthTransport, host hostCallback) (credential, *pluginabi.Error) {
+	refreshed, failure := g.refresh(pluginapi.AuthRefreshRequest{
+		AuthID:       authID,
+		AuthProvider: authProvider,
+		StorageJSON:  storageJSON,
+		Metadata:     authMeta,
+		Attributes:   authAttrs,
+	}, transport)
+	if failure != nil {
+		if failure.HTTPStatus == 401 {
+			return credential{}, expiredCredential()
+		}
+		return credential{}, failure
+	}
+	next, failure := readCredential(authProvider, refreshed.Auth.StorageJSON)
+	if failure != nil {
+		return credential{}, expiredCredential()
+	}
+	if host != nil && len(refreshed.Auth.StorageJSON) > 0 {
+		if name := authFileNameForSave(authID, authAttrs, refreshed.Auth.FileName); name != "" {
+			host(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
+				Name: name,
+				JSON: json.RawMessage(refreshed.Auth.StorageJSON),
+			})
+		}
+	}
+	return next, nil
+}
+
+func (g *generation) ensureFreshCredential(authID, authProvider string, storageJSON []byte, authMeta map[string]any, authAttrs map[string]string, transport oauthTransport, host hostCallback) (credential, bool, *pluginabi.Error) {
+	saved, failure := readCredential(authProvider, storageJSON)
+	if failure != nil {
+		return credential{}, false, failure
+	}
+	if time.Now().Add(time.Minute).Before(saved.Expires) {
+		return saved, false, nil
+	}
+	if strings.TrimSpace(saved.Refresh) == "" {
+		return credential{}, false, expiredCredential()
+	}
+	refreshed, failure := g.refreshAndPersist(authID, authProvider, storageJSON, authMeta, authAttrs, transport, host)
+	if failure != nil {
+		return credential{}, false, failure
+	}
+	return refreshed, true, nil
 }

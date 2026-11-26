@@ -1,7 +1,7 @@
 {
   "id": "aws-quickwork",
   "name": "Amazon QuickWork",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "description": "CPA-native QuickWork OAuth and direct Chat Completions without an HTTP bridge.",
   "license": "MIT",
   "abi_version": 1,

@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 /*
@@ -46,8 +48,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
-
-func main() {}
 
 var (
 	nativeHost C.qw_host

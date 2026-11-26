@@ -11,5 +11,6 @@ require (
 require (
 	github.com/MoeForge/moego v0.1.0-alpha.4 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 )

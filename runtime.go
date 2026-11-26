@@ -17,7 +17,7 @@ import (
 const (
 	id             = "aws-quickwork"
 	name           = "Amazon QuickWork"
-	version        = "0.2.1"
+	version        = "0.3.1"
 	maxRPC         = 4 << 20
 	personal       = id + "-personal"
 	enterprise     = id + "-enterprise"
@@ -27,20 +27,52 @@ const (
 var modes = []string{"smart", "fast", "balanced", "auto"}
 
 type settings struct {
-	Enabled bool
-	Timeout time.Duration
+	Enabled          bool
+	Timeout          time.Duration
+	SessionReuse     bool
+	SessionTTL       time.Duration
+	KeepSessions     bool
+	ThinkingEffort   string
+	ChatAgentID      string
+	Timezone         string
+	Locale           string
+	OutpostID        string
+	WorkingSessionID string
+	ProxyURL         string
+}
+
+func defaultSettings() settings {
+	return settings{
+		Enabled:      true,
+		Timeout:      5 * time.Minute,
+		SessionReuse: true,
+		SessionTTL:   30 * time.Minute,
+		KeepSessions: false,
+		Timezone:     "UTC",
+		Locale:       "en-US",
+	}
 }
 
 func parseSettings(raw []byte) (settings, *pluginabi.Error) {
-	cfg := settings{Enabled: true, Timeout: 2 * time.Minute}
+	cfg := defaultSettings()
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return cfg, nil
 	}
 	var fields struct {
-		Enabled  *bool     `yaml:"enabled"`
-		Priority int       `yaml:"priority"`
-		Store    yaml.Node `yaml:"store"`
-		Timeout  string    `yaml:"request_timeout"`
+		Enabled          *bool     `yaml:"enabled"`
+		Priority         int       `yaml:"priority"`
+		Store            yaml.Node `yaml:"store"`
+		Timeout          string    `yaml:"request_timeout"`
+		SessionReuse     *bool     `yaml:"session_reuse"`
+		SessionTTL       string    `yaml:"session_ttl"`
+		KeepSessions     *bool     `yaml:"keep_sessions"`
+		ThinkingEffort   string    `yaml:"thinking_effort"`
+		ChatAgentID      string    `yaml:"chat_agent_id"`
+		Timezone         string    `yaml:"timezone"`
+		Locale           string    `yaml:"locale"`
+		OutpostID        string    `yaml:"outpost_id"`
+		WorkingSessionID string    `yaml:"working_session_id"`
+		ProxyURL         string    `yaml:"proxy_url"`
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	decoder.KnownFields(true)
@@ -52,11 +84,46 @@ func parseSettings(raw []byte) (settings, *pluginabi.Error) {
 		cfg.Enabled = *fields.Enabled
 	}
 	if fields.Timeout != "" {
-		span, err := time.ParseDuration(fields.Timeout)
-		if err != nil || span < time.Second || span > 5*time.Minute {
+		span, err := time.ParseDuration(strings.TrimSpace(fields.Timeout))
+		if err != nil || span < time.Second || span > 10*time.Minute {
 			return settings{}, bad
 		}
 		cfg.Timeout = span
+	}
+	if fields.SessionReuse != nil {
+		cfg.SessionReuse = *fields.SessionReuse
+	}
+	if fields.SessionTTL != "" {
+		span, err := time.ParseDuration(strings.TrimSpace(fields.SessionTTL))
+		if err != nil || span < time.Minute || span > 24*time.Hour {
+			return settings{}, bad
+		}
+		cfg.SessionTTL = span
+	}
+	if fields.KeepSessions != nil {
+		cfg.KeepSessions = *fields.KeepSessions
+	}
+	effort := strings.ToLower(strings.TrimSpace(fields.ThinkingEffort))
+	switch effort {
+	case "", "off", "low", "medium", "high":
+		cfg.ThinkingEffort = effort
+	default:
+		return settings{}, bad
+	}
+	cfg.ChatAgentID = strings.TrimSpace(fields.ChatAgentID)
+	if tz := strings.TrimSpace(fields.Timezone); tz != "" {
+		cfg.Timezone = tz
+	}
+	if loc := strings.TrimSpace(fields.Locale); loc != "" {
+		cfg.Locale = loc
+	}
+	cfg.OutpostID = strings.TrimSpace(fields.OutpostID)
+	cfg.WorkingSessionID = strings.TrimSpace(fields.WorkingSessionID)
+	if proxyRaw := strings.TrimSpace(fields.ProxyURL); proxyRaw != "" {
+		if err := validateProxySetting(proxyRaw); err != nil {
+			return settings{}, pluginabi.NewError("invalid_config", "Invalid QuickWork proxy_url: "+err.Error(), 400)
+		}
+		cfg.ProxyURL = proxyRaw
 	}
 	return cfg, nil
 }
@@ -75,6 +142,7 @@ type generation struct {
 	flows     sync.Map
 	refreshMu sync.Mutex
 	refreshes map[string]*refreshFlight
+	sessions  *conversationStore
 }
 
 func (e *engine) swap(cfg *settings) {
@@ -89,7 +157,12 @@ func (e *engine) swap(cfg *settings) {
 	e.generation = nil
 	if cfg != nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		e.generation = &generation{settings: *cfg, ctx: ctx, cancel: cancel}
+		e.generation = &generation{
+			settings: *cfg,
+			ctx:      ctx,
+			cancel:   cancel,
+			sessions: newConversationStore(cfg.SessionTTL, 256),
+		}
 	}
 	e.mu.Unlock()
 	if old != nil {
@@ -138,7 +211,15 @@ func models() pluginapi.ModelResponse {
 func registration() any {
 	return map[string]any{"schema_version": pluginabi.SchemaVersion,
 		"metadata": pluginapi.Metadata{Name: name, Version: version, Author: "stark-shadow", GitHubRepository: "https://github.com/stark-shadow/cpa-plugin-aws-quickwork", ConfigFields: []pluginapi.ConfigField{
-			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "2m", Description: "Total upstream chat deadline (1s to 5m)."},
+			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "5m", Description: "Total upstream chat deadline (1s to 10m)."},
+			{Name: "session_reuse", Type: pluginapi.ConfigFieldTypeBoolean, Default: true, Description: "Reuse upstream QuickWork threads per account/conversation and send only new messages."},
+			{Name: "session_ttl", Type: pluginapi.ConfigFieldTypeString, Default: "30m", Description: "Idle lifetime of in-memory conversation reuse state (1m to 24h)."},
+			{Name: "keep_sessions", Type: pluginapi.ConfigFieldTypeBoolean, Default: false, Description: "Keep upstream sessions when session_reuse is disabled."},
+			{Name: "thinking_effort", Type: pluginapi.ConfigFieldTypeEnum, Default: "", EnumValues: []string{"", "off", "low", "medium", "high"}, Description: "Optional upstream thinking effort override."},
+			{Name: "chat_agent_id", Type: pluginapi.ConfigFieldTypeString, Default: "", Description: "Optional custom QuickWork agent ID for system prompt and tool isolation."},
+			{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Default: "UTC", Description: "User timezone forwarded in user_message."},
+			{Name: "locale", Type: pluginapi.ConfigFieldTypeString, Default: "en-US", Description: "User locale forwarded in user_message."},
+			{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Default: "", Description: "Optional outbound proxy URL (http://, https://, socks5://, socks5h://, or direct)."},
 		}},
 		"capabilities": map[string]any{"auth_provider": true, "model_provider": true, "executor": true, "quota_provider": true, "management_api": true,
 			"executor_model_scope": pluginapi.ExecutorModelScopeOAuth, "executor_input_formats": []string{"openai"}, "executor_output_formats": []string{"openai"}},
@@ -250,13 +331,7 @@ func (e *engine) call(method string, raw []byte, host hostCallback, transport ..
 		if failure := decode(raw, &req); failure != nil {
 			return nil, failure
 		}
-		if strings.TrimSpace(req.AuthID) == "" || strings.TrimSpace(req.AuthIndex) == "" {
-			return nil, badCredential()
-		}
-		if _, failure := readCredential(req.Provider, req.StorageJSON); failure != nil {
-			return nil, failure
-		}
-		return nil, pluginabi.NewError("quota_unavailable", "QuickWork 没有向此登录凭据提供账户剩余额度；请在 Amazon Quick 中查看。此状态不代表额度为零。 / Account balance is not available to this OAuth credential.", 501)
+		return run.fetchQuota(req, host, authHTTP)
 	case pluginabi.MethodExecutorExecute, pluginabi.MethodExecutorExecuteStream:
 		var req struct {
 			pluginapi.ExecutorRequest
@@ -266,9 +341,9 @@ func (e *engine) call(method string, raw []byte, host hostCallback, transport ..
 			return nil, failure
 		}
 		if method == pluginabi.MethodExecutorExecuteStream {
-			return run.executeStream(req.ExecutorRequest, req.StreamID, host)
+			return run.executeStream(req.ExecutorRequest, req.StreamID, host, authHTTP)
 		}
-		return run.execute(req.ExecutorRequest)
+		return run.execute(req.ExecutorRequest, host, authHTTP)
 	case pluginabi.MethodQuotaReset, pluginabi.MethodExecutorCountTokens, pluginabi.MethodExecutorHTTPRequest:
 		return nil, pluginabi.NewError("unsupported_operation", "Operation not supported by QuickWork", 501)
 	default:
