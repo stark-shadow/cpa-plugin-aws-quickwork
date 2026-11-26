@@ -42,6 +42,16 @@ func TestOMCResourceRPC(t *testing.T) {
 	if logoResp.StatusCode != http.StatusOK || logoResp.Headers.Get("Content-Type") != "image/svg+xml" || len(logoResp.Body) == 0 {
 		t.Fatalf("unexpected logo.svg response: %+v", logoResp)
 	}
+	authVal, authFail := runtime.call(pluginabi.MethodAuthIdentifier, nil, nil)
+	if authFail != nil {
+		t.Fatalf("auth identifier: %v", authFail)
+	}
+	var authResp struct {
+		Entries []pluginapi.AuthProviderEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(raw(authVal), &authResp); err != nil || len(authResp.Entries) != 2 || authResp.Entries[0].Logo != personalLogoURL || authResp.Entries[1].Logo != enterpriseLogoURL {
+		t.Fatalf("unexpected auth provider entry logos: %+v (%v)", authResp.Entries, err)
+	}
 	for _, test := range []struct {
 		method string
 		path   string

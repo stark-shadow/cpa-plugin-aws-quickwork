@@ -17,7 +17,7 @@ import (
 const (
 	id             = "aws-quickwork"
 	name           = "Amazon QuickWork"
-	version        = "0.3.2"
+	version        = "0.3.3"
 	maxRPC         = 4 << 20
 	personal       = id + "-personal"
 	enterprise     = id + "-enterprise"
@@ -273,8 +273,8 @@ func (e *engine) call(method string, raw []byte, host hostCallback, transport ..
 	switch method {
 	case pluginabi.MethodAuthIdentifier:
 		return map[string]any{"identifier": personal, "identifiers": []string{personal, enterprise}, "credential_providers": []string{id}, "entries": []pluginapi.AuthProviderEntry{
-			{Identifier: personal, Name: "QuickWork Personal", Logo: publicResourceBase + "/personal.svg"},
-			{Identifier: enterprise, Name: "QuickWork Enterprise (SSO)", Logo: publicResourceBase + "/enterprise.svg"},
+			{Identifier: personal, Name: "QuickWork Personal", Logo: personalLogoURL},
+			{Identifier: enterprise, Name: "QuickWork Enterprise (SSO)", Logo: enterpriseLogoURL},
 		}}, nil
 	case pluginabi.MethodExecutorIdentifier, pluginabi.MethodQuotaIdentifier:
 		return map[string]string{"identifier": id}, nil

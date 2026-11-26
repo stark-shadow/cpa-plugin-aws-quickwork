@@ -80,8 +80,11 @@ plugins:
                 plugin = next(entry for entry in listing['plugins'] if entry['id'] == plugin_id)
                 entries = {entry['identifier']: entry for entry in plugin['oauth_provider_entries']}
                 assert set(entries) == {f'{plugin_id}-personal', f'{plugin_id}-enterprise'}, set(entries)
+                assert plugin.get('logo', '').startswith('https://') and plugin['logo'].endswith('/assets/logo.svg'), plugin
                 for provider in entries.values():
-                    with opener.open(f"http://127.0.0.1:{port}{provider['logo']}", timeout=3) as image:
+                    assert provider['logo'].startswith('https://') and provider['logo'].endswith('.svg'), provider
+                for svg_name in ('logo.svg', 'personal.svg', 'enterprise.svg'):
+                    with opener.open(f'http://127.0.0.1:{port}/v0/resource/plugins/{plugin_id}/{svg_name}', timeout=3) as image:
                         assert image.headers.get_content_type() == 'image/svg+xml' and image.read().startswith(b'<svg ')
                 for account in ('personal', 'enterprise'):
                     provider = f'{plugin_id}-{account}'
