@@ -378,38 +378,38 @@ func usageSnapshotToQuota(snapshot *usageSnapshot, portal string) pluginapi.Quot
 		if bucket.ResetsAt > 0 {
 			reset = time.Unix(bucket.ResetsAt, 0).UTC().Format(time.RFC3339)
 		}
-		var frac float64
-		var desc string
 		switch {
 		case bucket.Used != nil && bucket.Limit != nil && *bucket.Limit > 0:
 			remaining := math.Max(0, *bucket.Limit-*bucket.Used)
-			frac = clamp01(remaining / *bucket.Limit)
-			desc = fmt.Sprintf("%s / %s min left (%s used)", formatQuotaNumber(remaining), formatQuotaNumber(*bucket.Limit), formatQuotaNumber(*bucket.Used))
-			out.Summary = append(out.Summary, pluginapi.QuotaMetric{
-				Key:    keyPrefix + "_remaining",
-				Label:  labelPrefix + " Remaining",
-				Value:  roundQuota(remaining),
-				Unit:   "minutes",
-				Format: "number",
+			frac := clamp01(remaining / *bucket.Limit)
+			desc := fmt.Sprintf("%s / %s min left (%s used)", formatQuotaNumber(remaining), formatQuotaNumber(*bucket.Limit), formatQuotaNumber(*bucket.Used))
+			if bucket.Warning != "" {
+				desc += " [" + bucket.Warning + "]"
+			}
+			group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{
+				Window:            window,
+				RemainingFraction: frac,
+				ResetTime:         reset,
+				Description:       desc,
 			})
 		case bucket.Limit != nil && *bucket.Limit == 0:
-			frac = 0
 			used := 0.0
 			if bucket.Used != nil {
 				used = *bucket.Used
 			}
-			desc = fmt.Sprintf("%s / 0 min", formatQuotaNumber(used))
+			desc := fmt.Sprintf("%s / 0 min", formatQuotaNumber(used))
+			if bucket.Warning != "" {
+				desc += " [" + bucket.Warning + "]"
+			}
+			group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{
+				Window:            window,
+				RemainingFraction: 0,
+				ResetTime:         reset,
+				Description:       desc,
+			})
 		case bucket.Used != nil:
-			frac = 1
-			desc = fmt.Sprintf("%s min used (no cap reported)", formatQuotaNumber(*bucket.Used))
-		case bucket.Limit != nil:
-			frac = 1
-			desc = fmt.Sprintf("%s min limit (usage unreported)", formatQuotaNumber(*bucket.Limit))
-		}
-		if bucket.Warning != "" {
-			desc += " [" + bucket.Warning + "]"
-		}
-		if bucket.Used != nil {
+			// Uncapped usage (e.g. pay-as-you-go overage without a reported cap):
+			// report as a plain summary metric instead of fabricating a 100% bar.
 			out.Summary = append(out.Summary, pluginapi.QuotaMetric{
 				Key:    keyPrefix + "_used",
 				Label:  labelPrefix + " Used",
@@ -417,8 +417,7 @@ func usageSnapshotToQuota(snapshot *usageSnapshot, portal string) pluginapi.Quot
 				Unit:   "minutes",
 				Format: "number",
 			})
-		}
-		if bucket.Limit != nil {
+		case bucket.Limit != nil:
 			out.Summary = append(out.Summary, pluginapi.QuotaMetric{
 				Key:    keyPrefix + "_limit",
 				Label:  labelPrefix + " Limit",
@@ -427,12 +426,6 @@ func usageSnapshotToQuota(snapshot *usageSnapshot, portal string) pluginapi.Quot
 				Format: "number",
 			})
 		}
-		group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{
-			Window:            window,
-			RemainingFraction: frac,
-			ResetTime:         reset,
-			Description:       desc,
-		})
 	}
 	appendBucket("Monthly", "monthly", "Monthly", snapshot.Monthly)
 	appendBucket("Monthly Overage", "overage_monthly", "Monthly Overage", snapshot.OverageMonthly)

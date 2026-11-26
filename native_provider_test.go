@@ -516,16 +516,15 @@ func TestOfficialQuotaFetchAndErrorStates(t *testing.T) {
 		if resp.Subscription == nil || resp.Subscription.Plan != "PRO" {
 			t.Fatalf("unexpected subscription: %+v", resp.Subscription)
 		}
-		if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 2 {
-			t.Fatalf("unexpected groups: %+v", resp.Groups)
+		if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 1 {
+			t.Fatalf("expected 1 capped monthly bucket without fabricating a bar for uncapped overage, got %+v", resp.Groups)
 		}
 		monthly := resp.Groups[0].Buckets[0]
 		if monthly.RemainingFraction != 0.75 || !strings.Contains(monthly.Description, "75 / 100") || !strings.Contains(monthly.Description, "[info]") {
 			t.Fatalf("unexpected monthly bucket: %+v", monthly)
 		}
-		overage := resp.Groups[0].Buckets[1]
-		if overage.RemainingFraction != 1 || !strings.Contains(overage.Description, "no cap reported") {
-			t.Fatalf("uncapped overage must not be treated as zero: %+v", overage)
+		if len(resp.Summary) != 1 || resp.Summary[0].Key != "overage_monthly_used" || resp.Summary[0].Value != 5 {
+			t.Fatalf("expected only uncapped overage metric in summary (no duplicate capped monthly rows), got %+v", resp.Summary)
 		}
 	})
 
