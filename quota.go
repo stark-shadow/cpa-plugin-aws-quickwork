@@ -382,7 +382,7 @@ func usageSnapshotToQuota(snapshot *usageSnapshot, portal string) pluginapi.Quot
 		case bucket.Used != nil && bucket.Limit != nil && *bucket.Limit > 0:
 			remaining := math.Max(0, *bucket.Limit-*bucket.Used)
 			frac := clamp01(remaining / *bucket.Limit)
-			desc := fmt.Sprintf("%s / %s min left (%s used)", formatQuotaNumber(remaining), formatQuotaNumber(*bucket.Limit), formatQuotaNumber(*bucket.Used))
+			desc := fmt.Sprintf("%s / %s min left", formatQuotaNumber(remaining), formatQuotaNumber(*bucket.Limit))
 			if bucket.Warning != "" {
 				desc += " [" + bucket.Warning + "]"
 			}

@@ -520,7 +520,7 @@ func TestOfficialQuotaFetchAndErrorStates(t *testing.T) {
 			t.Fatalf("expected 1 capped monthly bucket without fabricating a bar for uncapped overage, got %+v", resp.Groups)
 		}
 		monthly := resp.Groups[0].Buckets[0]
-		if monthly.RemainingFraction != 0.75 || !strings.Contains(monthly.Description, "75 / 100") || !strings.Contains(monthly.Description, "[info]") {
+		if monthly.RemainingFraction != 0.75 || monthly.Description != "75 / 100 min left [info]" {
 			t.Fatalf("unexpected monthly bucket: %+v", monthly)
 		}
 		if len(resp.Summary) != 1 || resp.Summary[0].Key != "overage_monthly_used" || resp.Summary[0].Value != 5 {
