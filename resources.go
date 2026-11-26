@@ -9,9 +9,13 @@ import (
 
 const publicResourceBase = "/v0/resource/plugins/" + id
 const descriptorPath = publicResourceBase + "/omc.json"
+const pluginLogoURL = "https://raw.githubusercontent.com/stark-shadow/cpa-plugin-aws-quickwork/main/assets/logo.svg"
 
 //go:embed aws-quickwork.omc.json
 var omcDescriptor string
+
+//go:embed assets/logo.svg
+var pluginLogoSVG string
 
 const personalLogo = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><rect width="48" height="48" rx="12" fill="#0d766f"/><g fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"><circle cx="24" cy="17" r="5"/><path d="M14 34v-2a10 8 0 0 1 20 0v2"/></g></svg>`
 
@@ -22,6 +26,8 @@ func publicResource(req pluginapi.ManagementRequest) pluginapi.ManagementRespons
 	switch req.Path {
 	case descriptorPath:
 		body, media = omcDescriptor, "application/json; charset=utf-8"
+	case publicResourceBase + "/logo.svg":
+		body, media = pluginLogoSVG, "image/svg+xml"
 	case publicResourceBase + "/personal.svg":
 		body, media = personalLogo, "image/svg+xml"
 	case publicResourceBase + "/enterprise.svg":

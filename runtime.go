@@ -17,7 +17,7 @@ import (
 const (
 	id             = "aws-quickwork"
 	name           = "Amazon QuickWork"
-	version        = "0.3.1"
+	version        = "0.3.2"
 	maxRPC         = 4 << 20
 	personal       = id + "-personal"
 	enterprise     = id + "-enterprise"
@@ -210,7 +210,7 @@ func models() pluginapi.ModelResponse {
 
 func registration() any {
 	return map[string]any{"schema_version": pluginabi.SchemaVersion,
-		"metadata": pluginapi.Metadata{Name: name, Version: version, Author: "stark-shadow", GitHubRepository: "https://github.com/stark-shadow/cpa-plugin-aws-quickwork", ConfigFields: []pluginapi.ConfigField{
+		"metadata": pluginapi.Metadata{Name: name, Version: version, Author: "stark-shadow", GitHubRepository: "https://github.com/stark-shadow/cpa-plugin-aws-quickwork", Logo: pluginLogoURL, ConfigFields: []pluginapi.ConfigField{
 			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "5m", Description: "Total upstream chat deadline (1s to 10m)."},
 			{Name: "session_reuse", Type: pluginapi.ConfigFieldTypeBoolean, Default: true, Description: "Reuse upstream QuickWork threads per account/conversation and send only new messages."},
 			{Name: "session_ttl", Type: pluginapi.ConfigFieldTypeString, Default: "30m", Description: "Idle lifetime of in-memory conversation reuse state (1m to 24h)."},
@@ -279,7 +279,7 @@ func (e *engine) call(method string, raw []byte, host hostCallback, transport ..
 	case pluginabi.MethodExecutorIdentifier, pluginabi.MethodQuotaIdentifier:
 		return map[string]string{"identifier": id}, nil
 	case pluginabi.MethodManagementRegister:
-		return map[string]any{"routes": []map[string]string{{"method": "POST", "path": discoveryRoute}}, "resources": []map[string]string{{"path": "/omc.json"}, {"path": "/personal.svg"}, {"path": "/enterprise.svg"}}}, nil
+		return map[string]any{"routes": []map[string]string{{"method": "POST", "path": discoveryRoute}}, "resources": []map[string]string{{"path": "/omc.json"}, {"path": "/logo.svg"}, {"path": "/personal.svg"}, {"path": "/enterprise.svg"}}}, nil
 	case pluginabi.MethodManagementHandle:
 		var req pluginapi.ManagementRequest
 		if failure := decode(raw, &req); failure != nil {

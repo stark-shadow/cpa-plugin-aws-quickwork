@@ -21,8 +21,26 @@ func TestOMCResourceRPC(t *testing.T) {
 		Routes    []struct{ Method, Path string }
 		Resources []struct{ Path string }
 	}
-	if json.Unmarshal(raw(value), &registered) != nil || len(registered.Routes) != 1 || registered.Routes[0].Path != discoveryRoute || registered.Routes[0].Method != http.MethodPost || len(registered.Resources) != 3 || registered.Resources[0].Path != "/omc.json" {
+	if json.Unmarshal(raw(value), &registered) != nil || len(registered.Routes) != 1 || registered.Routes[0].Path != discoveryRoute || registered.Routes[0].Method != http.MethodPost || len(registered.Resources) != 4 || registered.Resources[0].Path != "/omc.json" || registered.Resources[1].Path != "/logo.svg" {
 		t.Fatalf("unexpected resource registration: %+v", registered)
+	}
+	regVal, regFail := runtime.call(pluginabi.MethodPluginRegister, raw(map[string]any{"schema_version": pluginabi.SchemaVersion}), nil)
+	if regFail != nil {
+		t.Fatalf("plugin register: %v", regFail)
+	}
+	var regResp struct {
+		Metadata pluginapi.Metadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(raw(regVal), &regResp); err != nil || regResp.Metadata.Logo != pluginLogoURL {
+		t.Fatalf("unexpected metadata logo: %+v (%v)", regResp.Metadata, err)
+	}
+	logoVal, logoFail := runtime.call(pluginabi.MethodManagementHandle, raw(pluginapi.ManagementRequest{Method: http.MethodGet, Path: publicResourceBase + "/logo.svg"}), nil)
+	if logoFail != nil {
+		t.Fatalf("logo.svg fetch: %v", logoFail)
+	}
+	logoResp := logoVal.(pluginapi.ManagementResponse)
+	if logoResp.StatusCode != http.StatusOK || logoResp.Headers.Get("Content-Type") != "image/svg+xml" || len(logoResp.Body) == 0 {
+		t.Fatalf("unexpected logo.svg response: %+v", logoResp)
 	}
 	for _, test := range []struct {
 		method string
