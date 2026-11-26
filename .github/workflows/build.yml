@@ -19,7 +19,7 @@ jobs:
       matrix:
         include:
           - { runner: ubuntu-24.04, os: linux, arch: amd64 }
-          - { runner: macos-26, os: darwin, arch: arm64 }
+          - { runner: macos-15-intel, os: darwin, arch: arm64 }
           - { runner: macos-15-intel, os: darwin, arch: amd64 }
           - { runner: windows-2025, os: windows, arch: amd64 }
     defaults:
@@ -53,18 +53,21 @@ jobs:
             throw "Unexpected MinGW-w64 target: $target"
           }
           "CC=$gcc" >> $env:GITHUB_ENV
-      - name: Assert native Go target and compiler
+      - name: Assert Go target and compiler
         env:
           EXPECTED_OS: ${{ matrix.os }}
           EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
           go version
           host="$(go env GOHOSTOS)/$(go env GOHOSTARCH)"
-          target="$(go env GOOS)/$(go env GOARCH)"
           expected="$EXPECTED_OS/$EXPECTED_ARCH"
-          echo "Go host=$host, target=$target, expected=$expected"
-          test "$host" = "$expected"
-          test "$target" = "$expected"
+          echo "Go host=$host, expected=$expected"
+          if [[ "$expected" == "darwin/arm64" && "$host" == "darwin/amd64" ]]; then
+            echo "Cross-compiling darwin/arm64 on macOS Intel host with Apple clang"
+          else
+            test "$host" = "$expected"
+            test "$(go env GOOS)/$(go env GOARCH)" = "$expected"
+          fi
           cc="$(go env CC)"
           if [[ "$EXPECTED_OS" == windows ]]; then
             cc="$(cygpath -u "$cc")"
@@ -75,7 +78,13 @@ jobs:
           EXPECTED_OS: ${{ matrix.os }}
           EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
-          ./build.sh
+          host="$(go env GOHOSTOS)/$(go env GOHOSTARCH)"
+          if [[ "$EXPECTED_OS/$EXPECTED_ARCH" == "darwin/arm64" && "$host" == "darwin/amd64" ]]; then
+            GOOS=darwin GOARCH=arm64 CGO_CFLAGS="-arch arm64" CGO_LDFLAGS="-arch arm64" ./build.sh
+            lipo -info dist/aws-quickwork.dylib
+          else
+            ./build.sh
+          fi
           archive=$(python .github/release_assets.py stage dist artifact "$EXPECTED_OS/$EXPECTED_ARCH")
           QUICKWORK_INSTALL_ARCHIVE="$archive" go test -count=1 -v ./...
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
