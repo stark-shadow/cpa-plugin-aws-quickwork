@@ -111,6 +111,147 @@ func readCredential(provider string, raw []byte) (credential, *pluginabi.Error) 
 	return saved, nil
 }
 
+var credentialOwnedKeys = map[string]struct{}{
+	"type":           {},
+	"oauth_provider": {},
+	"tenant":         {},
+	"token_url":      {},
+	"client_id":      {},
+	"client_secret":  {},
+	"access_token":   {},
+	"refresh_token":  {},
+	"id_token":       {},
+	"expires_at":     {},
+	"actor":          {},
+	"aws_account_id": {},
+	"region":         {},
+	"email":          {},
+	"label":          {},
+}
+
+func isHostManagedMetadataKey(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	if normalized == "" || normalized == "refresh_interval_seconds" {
+		return false
+	}
+	_, owned := credentialOwnedKeys[normalized]
+	return !owned
+}
+
+// persistedHostMetadata extracts CPA host-managed fields (such as note,
+// prefix, priority, weight, proxy_url, disabled, excluded_models, headers,
+// disable_cooling, request_retry, etc.) from persisted auth JSON while
+// excluding QuickWork credential and identity keys owned by StorageJSON.
+func persistedHostMetadata(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var decoded map[string]any
+	if json.Unmarshal(raw, &decoded) != nil || len(decoded) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(decoded))
+	for key, value := range decoded {
+		if isHostManagedMetadataKey(key) {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// refreshHostMetadata carries CPA host-managed fields across a token refresh.
+// Runtime reqMetadata wins (including explicit clears such as note=""), while
+// persisted fields in storageJSON fill gaps when absent from reqMetadata.
+func refreshHostMetadata(reqMetadata map[string]any, storageJSON []byte) map[string]any {
+	out := make(map[string]any, len(reqMetadata))
+	for key, value := range reqMetadata {
+		if isHostManagedMetadataKey(key) {
+			out[key] = value
+		}
+	}
+	for key, value := range persistedHostMetadata(storageJSON) {
+		if _, exists := out[key]; !exists {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func applyHostScalarFields(hostMeta map[string]any, prefix, proxyURL *string, disabled *bool) {
+	if len(hostMeta) == 0 {
+		return
+	}
+	if val, exists := hostMeta["prefix"]; exists && prefix != nil {
+		if text, ok := val.(string); ok {
+			*prefix = strings.TrimSpace(text)
+		} else if val == nil {
+			*prefix = ""
+		}
+	}
+	if val, exists := hostMeta["proxy_url"]; exists && proxyURL != nil {
+		if text, ok := val.(string); ok {
+			*proxyURL = strings.TrimSpace(text)
+		} else if val == nil {
+			*proxyURL = ""
+		}
+	}
+	if val, exists := hostMeta["disabled"]; exists && disabled != nil {
+		if flag, ok := val.(bool); ok {
+			*disabled = flag
+		} else if val == nil {
+			*disabled = false
+		}
+	}
+}
+
+func syncAuthNoteAttribute(attrs map[string]string, meta map[string]any, prevAttrs map[string]string) {
+	if attrs == nil {
+		return
+	}
+	note := ""
+	if meta != nil {
+		if rawNote, ok := meta["note"].(string); ok {
+			note = strings.TrimSpace(rawNote)
+		}
+	}
+	if note != "" {
+		attrs["note"] = note
+		return
+	}
+	if prevAttrs != nil {
+		if _, hadPrevNote := prevAttrs["note"]; hadPrevNote {
+			// Explicitly emit empty note so CPA host refresh adapters do not
+			// backfill a stale Attributes["note"] when Metadata["note"] was cleared.
+			attrs["note"] = ""
+		}
+	}
+}
+
+func applyHostMetadata(auth *pluginapi.AuthData, hostMeta map[string]any, prevAttrs map[string]string) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range hostMeta {
+		if isHostManagedMetadataKey(key) {
+			auth.Metadata[key] = value
+		}
+	}
+	applyHostScalarFields(hostMeta, &auth.Prefix, &auth.ProxyURL, &auth.Disabled)
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	syncAuthNoteAttribute(auth.Attributes, auth.Metadata, prevAttrs)
+}
+
 func parseAuth(req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, *pluginabi.Error) {
 	var marker struct {
 		Type string `json:"type"`
@@ -124,6 +265,7 @@ func parseAuth(req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, *pl
 	}
 	result := saved.auth(req.RawJSON)
 	result.FileName = req.FileName
+	applyHostMetadata(&result, persistedHostMetadata(req.RawJSON), nil)
 	return pluginapi.AuthParseResponse{Handled: true, Auth: result}, nil
 }
 
@@ -718,17 +860,32 @@ type refreshFlight struct {
 	failure *pluginabi.Error
 }
 
-func mergeStorageJSON(base []byte, c credential) []byte {
+func mergeStorageJSON(base []byte, c credential, hostMeta map[string]any) []byte {
 	fresh, err := json.Marshal(c)
 	if err != nil {
 		return fresh
 	}
-	if len(base) == 0 {
-		return fresh
+	merged := make(map[string]any)
+	if len(base) > 0 {
+		if json.Unmarshal(base, &merged) != nil || merged == nil {
+			merged = make(map[string]any)
+		}
 	}
-	var merged map[string]any
-	if json.Unmarshal(base, &merged) != nil || merged == nil {
-		return fresh
+	for key, value := range hostMeta {
+		if !isHostManagedMetadataKey(key) {
+			continue
+		}
+		if value == nil {
+			delete(merged, key)
+			continue
+		}
+		if key == "note" || key == "prefix" || key == "proxy_url" {
+			if s, ok := value.(string); ok && strings.TrimSpace(s) == "" {
+				delete(merged, key)
+				continue
+			}
+		}
+		merged[key] = value
 	}
 	var overlay map[string]any
 	if json.Unmarshal(fresh, &overlay) != nil || overlay == nil {
@@ -782,21 +939,17 @@ func (g *generation) refresh(req pluginapi.AuthRefreshRequest, transport oauthTr
 	} else {
 		exchange = map[string]string{"grantType": "refresh_token", "clientId": saved.ClientID, "clientSecret": saved.ClientSecret, "refreshToken": saved.Refresh}
 	}
+	hostMeta := refreshHostMetadata(req.Metadata, req.StorageJSON)
+	applyHostScalarFields(hostMeta, &saved.Prefix, &saved.ProxyURL, &saved.Disabled)
 	ctx, cancel := context.WithTimeout(g.ctx, 30*time.Second)
 	defer cancel()
 	proxyRaw := effectiveProxyURL(saved.ProxyURL, firstString(req.Metadata, "proxy_url"), g.ProxyURL)
 	if pending.failure = saved.tokens(transport.withProxy(ctx, proxyRaw), exchange); pending.failure != nil {
 		return empty, pending.failure
 	}
-	updated := saved.auth(mergeStorageJSON(req.StorageJSON, saved))
+	updated := saved.auth(mergeStorageJSON(req.StorageJSON, saved, hostMeta))
 	updated.ID = req.AuthID
-	for key, value := range req.Metadata {
-		switch key {
-		case "access_token", "refresh_token", "id_token", "expires_at", "client_secret", "type", "email", "oauth_provider":
-			continue
-		}
-		updated.Metadata[key] = value
-	}
+	applyHostMetadata(&updated, hostMeta, req.Attributes)
 	pending.result = pluginapi.AuthRefreshResponse{Auth: updated, NextRefreshAfter: updated.NextRefreshAfter}
 	return pending.result, nil
 }

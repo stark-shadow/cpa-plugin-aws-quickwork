@@ -1017,3 +1017,235 @@ func TestOnDemandRefreshPersistsAndRetries(t *testing.T) {
 		}
 	})
 }
+
+func TestParseAuthPreservesHostMetadataAndNote(t *testing.T) {
+	var rt engine
+	cfg := defaultSettings()
+	rt.swap(&cfg)
+	t.Cleanup(rt.stop)
+
+	exp := time.Now().Add(45 * time.Minute).UTC().Truncate(time.Second)
+	cred := credential{
+		Type:         id,
+		Portal:       personal,
+		Tenant:       personalTenant,
+		TokenURL:     "https://oidc.us-east-1.amazonaws.com/token",
+		ClientID:     "fixture-client",
+		ClientSecret: "fixture-secret",
+		Access:       "fixture-access",
+		Refresh:      "fixture-refresh",
+		Identity:     "fixture-id",
+		Expires:      exp,
+		Actor:        "fixture-actor",
+		Email:        "user@example.invalid",
+		Label:        "User Example",
+		Prefix:       "team",
+		ProxyURL:     "http://127.0.0.1:8080",
+		Disabled:     true,
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(raw(cred), &payload)
+	payload["note"] = "  张三的账号  "
+	payload["priority"] = 2
+	payload["weight"] = 5
+	payload["disable_cooling"] = true
+	payload["request_retry"] = 3
+	payload["excluded_models"] = []string{"aws-quickwork-auto"}
+	payload["headers"] = map[string]any{"X-Custom": "value"}
+
+	value, failure := rt.call(pluginabi.MethodAuthParse, raw(pluginapi.AuthParseRequest{
+		Provider: id,
+		FileName: "aws-quickwork-test.json",
+		RawJSON:  raw(payload),
+	}), nil)
+	if failure != nil {
+		t.Fatalf("MethodAuthParse failed: %v", failure)
+	}
+	parsed := value.(pluginapi.AuthParseResponse)
+	if !parsed.Handled {
+		t.Fatal("expected Handled=true")
+	}
+	if parsed.Auth.Metadata["note"] != "  张三的账号  " || parsed.Auth.Attributes["note"] != "张三的账号" {
+		t.Fatalf("expected preserved note in metadata and trimmed note in attributes, got meta=%#v attrs=%#v", parsed.Auth.Metadata["note"], parsed.Auth.Attributes["note"])
+	}
+	if parsed.Auth.Prefix != "team" || parsed.Auth.ProxyURL != "http://127.0.0.1:8080" || !parsed.Auth.Disabled {
+		t.Fatalf("expected scalar fields from raw json, got prefix=%q proxy=%q disabled=%v", parsed.Auth.Prefix, parsed.Auth.ProxyURL, parsed.Auth.Disabled)
+	}
+	for _, key := range []string{"prefix", "proxy_url", "disabled", "priority", "weight", "disable_cooling", "request_retry", "excluded_models", "headers"} {
+		if _, exists := parsed.Auth.Metadata[key]; !exists {
+			t.Fatalf("expected host-managed metadata key %q to be preserved, got %#v", key, parsed.Auth.Metadata)
+		}
+	}
+	for _, secretKey := range []string{"access_token", "refresh_token", "id_token", "client_secret", "client_id", "token_url", "tenant", "actor", "label"} {
+		if _, leaked := parsed.Auth.Metadata[secretKey]; leaked {
+			t.Fatalf("credential-owned field %q must not leak into Metadata", secretKey)
+		}
+	}
+
+	// Blank or whitespace-only note must not populate Attributes["note"].
+	payload["note"] = "   "
+	blankResp, failure := parseAuth(pluginapi.AuthParseRequest{
+		Provider: id,
+		FileName: "aws-quickwork-blank.json",
+		RawJSON:  raw(payload),
+	})
+	if failure != nil || !blankResp.Handled {
+		t.Fatalf("parseAuth blank note failed: handled=%v err=%v", blankResp.Handled, failure)
+	}
+	if _, hasNoteAttr := blankResp.Auth.Attributes["note"]; hasNoteAttr {
+		t.Fatalf("expected blank note not to set Attributes[\"note\"], got %#v", blankResp.Auth.Attributes)
+	}
+}
+
+func TestRefreshPreservesAndClearsNoteAndHostMetadata(t *testing.T) {
+	var rt engine
+	cfg := defaultSettings()
+	rt.swap(&cfg)
+	t.Cleanup(rt.stop)
+
+	baseCred := credential{
+		Type:     id,
+		Portal:   personal,
+		Tenant:   personalTenant,
+		TokenURL: "https://oidc.us-east-1.amazonaws.com/token",
+		ClientID: "fixture-client",
+		Access:   "old-access",
+		Refresh:  "old-refresh",
+		Expires:  time.Now().Add(-time.Hour).UTC().Truncate(time.Second),
+		Actor:    "fixture-actor",
+		Email:    "user@example.invalid",
+		Prefix:   "old-prefix",
+	}
+
+	okTransport := func(_ string, httpReq pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		if !strings.HasSuffix(httpReq.URL, "/token") {
+			t.Fatalf("unexpected URL: %s", httpReq.URL)
+		}
+		return pluginapi.HTTPResponse{
+			StatusCode: 200,
+			Body:       raw(map[string]any{"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600}),
+		}, nil
+	}
+
+	t.Run("recovers_note_from_storage_when_missing_in_metadata", func(t *testing.T) {
+		var storageMap map[string]any
+		_ = json.Unmarshal(raw(baseCred), &storageMap)
+		storageMap["note"] = "主号备注"
+		storageMap["disable_cooling"] = true
+
+		val, failure := rt.call(pluginabi.MethodAuthRefresh, raw(struct {
+			pluginapi.AuthRefreshRequest
+			HostCallbackID string `json:"host_callback_id"`
+		}{
+			AuthRefreshRequest: pluginapi.AuthRefreshRequest{
+				AuthID:       "aws-quickwork-note.json",
+				AuthProvider: id,
+				StorageJSON:  raw(storageMap),
+				Metadata:     map[string]any{"type": id, "email": "user@example.invalid"},
+			},
+			HostCallbackID: "cb-note",
+		}), nil, okTransport)
+		if failure != nil {
+			t.Fatalf("MethodAuthRefresh failed: %v", failure)
+		}
+		resp := val.(pluginapi.AuthRefreshResponse)
+		if resp.Auth.Metadata["note"] != "主号备注" || resp.Auth.Attributes["note"] != "主号备注" || resp.Auth.Metadata["disable_cooling"] != true {
+			t.Fatalf("expected note and disable_cooling recovered, got meta=%#v attrs=%#v", resp.Auth.Metadata, resp.Auth.Attributes)
+		}
+		var saved map[string]any
+		if err := json.Unmarshal(resp.Auth.StorageJSON, &saved); err != nil || saved["note"] != "主号备注" {
+			t.Fatalf("expected note preserved in StorageJSON, got %s", string(resp.Auth.StorageJSON))
+		}
+	})
+
+	t.Run("metadata_update_and_clear_override_stale_storage_and_attributes", func(t *testing.T) {
+		var storageMap map[string]any
+		_ = json.Unmarshal(raw(baseCred), &storageMap)
+		storageMap["note"] = "旧备注"
+		storageMap["prefix"] = "old-prefix"
+
+		// Update note via runtime Metadata.
+		resp, failure := rt.generation.refresh(pluginapi.AuthRefreshRequest{
+			AuthID:       "aws-quickwork-note.json",
+			AuthProvider: id,
+			StorageJSON:  raw(storageMap),
+			Metadata:     map[string]any{"note": "  新备注  ", "prefix": "new-prefix"},
+			Attributes:   map[string]string{"note": "旧备注"},
+		}, oauthTransport{callbackID: "cb", send: okTransport})
+		if failure != nil {
+			t.Fatalf("refresh update failed: %v", failure)
+		}
+		if resp.Auth.Metadata["note"] != "  新备注  " || resp.Auth.Attributes["note"] != "新备注" || resp.Auth.Prefix != "new-prefix" {
+			t.Fatalf("updated note/prefix not applied: meta=%#v attrs=%#v prefix=%q", resp.Auth.Metadata, resp.Auth.Attributes, resp.Auth.Prefix)
+		}
+		var saved map[string]any
+		_ = json.Unmarshal(resp.Auth.StorageJSON, &saved)
+		if saved["note"] != "  新备注  " || saved["prefix"] != "new-prefix" {
+			t.Fatalf("updated note/prefix missing from StorageJSON: %s", string(resp.Auth.StorageJSON))
+		}
+
+		// Clear note, prefix, and proxy_url via runtime Metadata ("") while StorageJSON and Attributes still carry stale values.
+		storageMap["proxy_url"] = "http://127.0.0.1:8080"
+		cleared, failure := rt.generation.refresh(pluginapi.AuthRefreshRequest{
+			AuthID:       "aws-quickwork-note.json",
+			AuthProvider: id,
+			StorageJSON:  raw(storageMap),
+			Metadata:     map[string]any{"note": "", "prefix": "", "proxy_url": ""},
+			Attributes:   map[string]string{"note": "旧备注"},
+		}, oauthTransport{callbackID: "cb", send: okTransport})
+		if failure != nil {
+			t.Fatalf("refresh clear failed: %v", failure)
+		}
+		if noteAttr, exists := cleared.Auth.Attributes["note"]; !exists || noteAttr != "" {
+			t.Fatalf("expected explicit empty Attributes[\"note\"] to block stale host backfill, got exists=%v val=%q", exists, noteAttr)
+		}
+		if cleared.Auth.Prefix != "" || cleared.Auth.ProxyURL != "" {
+			t.Fatalf("expected cleared prefix and proxy_url, got prefix=%q proxy=%q", cleared.Auth.Prefix, cleared.Auth.ProxyURL)
+		}
+		var clearedSaved map[string]any
+		_ = json.Unmarshal(cleared.Auth.StorageJSON, &clearedSaved)
+		if _, hasNote := clearedSaved["note"]; hasNote {
+			t.Fatalf("expected cleared note to be removed from StorageJSON, got %s", string(cleared.Auth.StorageJSON))
+		}
+		if _, hasPrefix := clearedSaved["prefix"]; hasPrefix {
+			t.Fatalf("expected cleared prefix to be removed from StorageJSON, got %s", string(cleared.Auth.StorageJSON))
+		}
+	})
+
+	t.Run("on_demand_refreshAndPersist_keeps_note_through_host_save_and_reparse", func(t *testing.T) {
+		var storageMap map[string]any
+		_ = json.Unmarshal(raw(baseCred), &storageMap)
+		delete(storageMap, "proxy_url")
+		var savedReq *pluginapi.HostAuthSaveRequest
+		next, failure := rt.generation.refreshAndPersist(
+			"aws-quickwork-save.json",
+			id,
+			raw(storageMap),
+			map[string]any{"note": "持久备注"},
+			map[string]string{"path": "/tmp/aws-quickwork-save.json"},
+			oauthTransport{callbackID: "cb-save", send: okTransport},
+			func(method string, payload any) bool {
+				if method == pluginabi.MethodHostAuthSave {
+					req := payload.(pluginapi.HostAuthSaveRequest)
+					savedReq = &req
+					return true
+				}
+				return false
+			},
+		)
+		if failure != nil || next.Access != "new-access" || savedReq == nil {
+			t.Fatalf("refreshAndPersist failed: next=%+v savedReq=%+v err=%v", next, savedReq, failure)
+		}
+		reparsed, failure := parseAuth(pluginapi.AuthParseRequest{
+			Provider: id,
+			FileName: savedReq.Name,
+			RawJSON:  savedReq.JSON,
+		})
+		if failure != nil || !reparsed.Handled {
+			t.Fatalf("reparse after HostAuthSave failed: handled=%v err=%v", reparsed.Handled, failure)
+		}
+		if reparsed.Auth.Metadata["note"] != "持久备注" || reparsed.Auth.Attributes["note"] != "持久备注" {
+			t.Fatalf("expected note to survive HostAuthSave + parseAuth, got meta=%#v attrs=%#v", reparsed.Auth.Metadata, reparsed.Auth.Attributes)
+		}
+	})
+}

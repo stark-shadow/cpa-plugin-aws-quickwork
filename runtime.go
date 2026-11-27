@@ -17,7 +17,7 @@ import (
 const (
 	id             = "aws-quickwork"
 	name           = "Amazon QuickWork"
-	version        = "0.3.3"
+	version        = "0.3.4"
 	maxRPC         = 4 << 20
 	personal       = id + "-personal"
 	enterprise     = id + "-enterprise"
